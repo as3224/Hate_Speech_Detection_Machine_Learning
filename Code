@@ -1,1 +1,195 @@
+import numpy as np
+import pandas as pd
+import os
+import re
+import nltk
+import string
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
+from wordcloud import WordCloud, STOPWORDS
+from nltk.corpus import stopwords
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+import keras
+from keras.models import Sequential
+from keras.layers import LSTM, Embedding, SpatialDropout1D, Dense, Bidirectional
+from keras.optimizers import RMSprop
+from keras.preprocessing.text import Tokenizer
+from keras.preprocessing import sequence
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.layers import Layer
+from tensorflow.keras import backend as K
 
+# Custom SNP Layer
+class SimpleNeuralProcessor(Layer):
+    def __init__(self, output_dim, **kwargs):
+        self.output_dim = output_dim
+        super(SimpleNeuralProcessor, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.kernel = self.add_weight(name='kernel', shape=(input_shape[-1], self.output_dim), initializer='uniform', trainable=True)
+        super(SimpleNeuralProcessor, self).build(input_shape)
+
+    def call(self, x):
+        output = K.dot(x, self.kernel)
+        return output
+
+    def get_config(self):
+        config = super(SimpleNeuralProcessor, self).get_config()
+        config.update({'output_dim': self.output_dim})
+        return config
+
+# Load and preprocess the first dataset (Twitter Sentiment Analysis)
+df_twitter = pd.read_csv("/kaggle/input/twitter-sentiment-analysis-hatred-speech/train.csv")
+df_twitter.drop('id', axis=1, inplace=True)
+
+# Load and preprocess the second dataset (Hate Speech and Offensive Language)
+df_offensive = pd.read_csv("/kaggle/input/hate-speech-and-offensive-language-dataset/labeled_data.csv")
+df_offensive.drop(['Unnamed: 0', 'count', 'hate_speech', 'offensive_language', 'neither'], axis=1, inplace=True)
+df_offensive['class'].replace({0: 1, 2: 0}, inplace=True)
+df_offensive.rename(columns={'class': 'label'}, inplace=True)
+
+# Combine the two datasets
+frames = [df_twitter, df_offensive]
+df = pd.concat(frames)
+
+# Data Exploration
+sns.countplot('label', data=df)
+print(df.shape)
+
+# Text Cleaning and Preprocessing
+stemmer = nltk.SnowballStemmer("english")
+stopword = set(stopwords.words('english'))
+
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub('\[.*?\]', '', text)
+    text = re.sub('https?://\S+|www\.\S+', '', text)
+    text = re.sub('<.*?>+', '', text)
+    text = re.sub('[%s]' % re.escape(string.punctuation), '', text)
+    text = re.sub('\n', '', text)
+    text = re.sub('\w*\d\w*', '', text)
+    text = [word for word in text.split(' ') if word not in stopword]
+    text = " ".join(text)
+    text = [stemmer.stem(word) for word in text.split(' ')]
+    text = " ".join(text)
+    return text
+
+df['tweet'] = df['tweet'].apply(clean_text)
+
+# Create Word Cloud
+def make_wordcloud(df):
+    comment_words = ""
+    for val in df.tweet:
+        val = str(val).lower()
+        comment_words += " ".join(val) + " "
+    wordcloud = WordCloud(width=800, height=800, background_color='white', stopwords=STOPWORDS,
+                          min_font_size=10).generate(comment_words)
+    plt.figure(figsize=(8, 8), facecolor=None)
+    plt.imshow(wordcloud)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.show()
+
+# Visualize Word Cloud
+make_wordcloud(df)
+
+# Split data into train and test sets
+x = df['tweet']
+y = df['label']
+x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42)
+
+# Vectorize text data using CountVectorizer
+count = CountVectorizer(stop_words='english', ngram_range=(1, 5))
+x_train_vectorizer = count.fit_transform(x_train)
+x_test_vectorizer = count.transform(x_test)
+
+# Build and compile BiLSTM model
+max_words = 50000
+max_len = 300
+tokenizer = Tokenizer(num_words=max_words)
+tokenizer.fit_on_texts(x_train)
+sequences = tokenizer.texts_to_sequences(x_train)
+sequences_matrix = sequence.pad_sequences(sequences, maxlen=max_len)
+
+model = Sequential()
+model.add(Embedding(max_words, 100, input_length=max_len))
+model.add(SpatialDropout1D(0.2))
+model.add(Bidirectional(LSTM(100, dropout=0.2, recurrent_dropout=0.2, return_sequences=True)))
+model.add(SimpleNeuralProcessor(output_dim=64))  # Adjust output_dim as needed
+model.add(Dense(1, activation='sigmoid'))
+model.compile(loss='binary_crossentropy', optimizer=RMSprop(), metrics=['accuracy'])
+
+# Define EarlyStopping and ModelCheckpoint callbacks
+stop = EarlyStopping(
+    monitor='val_accuracy',
+    mode='max',
+    patience=5
+)
+
+checkpoint = ModelCheckpoint(
+    filepath='./',
+    save_weights_only=True,
+    monitor='val_accuracy',
+    mode='max',
+    save_best_only=True
+)
+
+# Tokenize and pad test data
+test_sequences = tokenizer.texts_to_sequences(x_test)
+test_sequences_matrix = sequence.pad_sequences(test_sequences, maxlen=max_len)
+
+# Train BiLSTM model
+model.fit(sequences_matrix, y_train, batch_size=128, epochs=10, validation_split=0.2, callbacks=[stop, checkpoint])
+
+# Evaluate BiLSTM model
+accr = model.evaluate(test_sequences_matrix, y_test)
+lstm_prediction = model.predict(test_sequences_matrix)
+
+# Convert predictions to binary labels
+res = np.array([1 if pred[0] >= 0.5 else 0 for pred in lstm_prediction], dtype=np.int32)
+
+# Print confusion matrix for BiLSTM model
+conf_matrix = confusion_matrix(y_test, res)
+print("Confusion Matrix:")
+print(conf_matrix)
+
+# Calculate precision, recall, and F1 score
+precision = precision_score(y_test, res)
+recall = recall_score(y_test, res)
+f1 = f1_score(y_test, res)
+
+# Print precision, recall, and F1 score
+print(f"Precision: {precision}")
+print(f"Recall: {recall}")
+print(f"F1 Score: {f1}")
+
+# Save Tokenizer and the BiLSTM model
+with open('tokenizer.pickle', 'wb') as handle:
+    pickle.dump(tokenizer, handle, protocol=pickle.HIGHEST_PROTOCOL)
+model.save("hate_abusive_model_bilstm.h5")
+
+# Load the trained BiLSTM model and tokenizer
+load_model = keras.models.load_model("hate_abusive_model_bilstm.h5", custom_objects={'SimpleNeuralProcessor': SimpleNeuralProcessor})
+with open('tokenizer.pickle', 'rb') as handle:
+    load_tokenizer = pickle.load(handle)
+
+# Test a new sentence
+test_text = 'I hate my country'
+
+# Preprocess the test sentence
+test_text = clean_text(test_text)
+test_text = [test_text]
+seq = load_tokenizer.texts_to_sequences(test_text)
+padded = sequence.pad_sequences(seq, maxlen=max_len)
+
+# Make a prediction with the loaded BiLSTM model
+pred = load_model.predict(padded)
+
+# Print the prediction
+if pred[0][0] < 0.5:
+    print("No hate")
+else:
+    print("Hate and abusive")
